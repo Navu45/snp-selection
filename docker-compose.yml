@@ -1,0 +1,8 @@
+services:
+  jupyter-server:
+    build: .
+    ports:
+      - "8888:8888"
+    volumes:
+      - "./data:/home/jovyan/data"
+    
