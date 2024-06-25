@@ -1,4 +1,4 @@
-FROM quay.io/jupyter/all-spark-notebook
+FROM quay.io/jupyter/all-spark-notebook:python-3.11.9
 
 USER root
 
@@ -11,5 +11,7 @@ RUN apt-get install -y \
     libopenblas-base liblapack3
 
 RUN python3 -m pip install hail
+
+WORKDIR /home/jovyan/work
 
 CMD ["jupyter", "notebook", "--port=8888", "--no-browser", "--ip=0.0.0.0", "--allow-root"]
