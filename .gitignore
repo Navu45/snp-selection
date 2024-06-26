@@ -2,3 +2,4 @@
 .local
 .npm
 .ipython
+__pycache__

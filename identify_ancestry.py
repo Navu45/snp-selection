@@ -11,18 +11,22 @@ def log_sum_exp(log_values):
     max_log = hl.max(log_values)
     return max_log + hl.log(hl.sum([hl.exp(log_value - max_log) for log_value in log_values]))
 
+ 
+def log_likelihood(genotype, freqs, pop):
+    return (
+        hl.case()
+        .when(genotype.is_hom_ref(), non_nan(hl.log(freqs[pop].p_AA)))
+        .when(genotype.is_het(), non_nan(hl.log(freqs[pop].p_AB)))
+        .when(genotype.is_hom_var(), non_nan(hl.log(freqs[pop].p_BB)))
+        .default(0.0)
+    )
 
-class AncestryPredictor:
-    def __init__(self, mt):
-        self.mt = mt
 
-        self.total_subjects = self.mt.count_cols()
-        ethnicity_counts = self.mt.aggregate_cols(hl.agg.counter(self.mt.pop))
-        proportions = {k: v / self.total_subjects for k, v in ethnicity_counts.items()}
-        self.proportions = proportions
+class AncestryPredictor:    
+    def __init__(self) -> None:
+        self.is_fitted = False
 
-    
-    def gt_freq_estimates(self, mt, groups):
+    def gt_freq_estimates(self, mt):
         count_AA = hl.agg.sum(mt.GT.is_hom_ref())
         count_AB = hl.agg.sum(mt.GT.is_het())
         total_count = hl.agg.count_where(hl.is_defined(mt.GT))
@@ -32,7 +36,7 @@ class AncestryPredictor:
             hl.agg.group_by(
                 mt.rsid,
                 hl.agg.group_by(
-                    groups,
+                    mt[self.group_name],
                     hl.struct(
                         p_ML = p_ML,
                         p_AA = p_ML ** 2,
@@ -42,34 +46,27 @@ class AncestryPredictor:
                 )
             )
         )
-
-    def annotate_with_freqs(self, mt, groups):
+    
+    def freqs_estimates(self, mt):
 
         def create_freqs_dataframe(snp_freqs):
-            rows = [{'rsid': rsid, 'pop_freqs': hl.struct(**pop_freqs)} 
-                    for rsid, pop_freqs in snp_freqs.items()]
+            rows = [{'rsid': rsid, 'freqs': hl.struct(**freqs)} 
+                    for rsid, freqs in snp_freqs.items()]
             return pd.DataFrame(rows)
         
-        snp_freqs = self.gt_freq_estimates(mt, groups)
+        snp_freqs = self.gt_freq_estimates(mt)
         freqs_ht = hl.Table.from_pandas(create_freqs_dataframe(snp_freqs), key='rsid')
+        return freqs_ht
+
+    def annotate_mt(self, mt):
         return mt.annotate_rows(
-            freqs=freqs_ht[mt.rsid].pop_freqs
-        )
-    
-    @staticmethod
-    def log_likelihood(genotype, freqs, pop):
-        return (
-            hl.case()
-            .when(genotype.is_hom_ref(), non_nan(hl.log(freqs[pop].p_AA)))
-            .when(genotype.is_het(), non_nan(hl.log(freqs[pop].p_AB)))
-            .when(genotype.is_hom_var(), non_nan(hl.log(freqs[pop].p_BB)))
-            .default(0.0)
+            freqs=self.freqs_ht[mt.rsid].freqs
         )
     
     def log_likelihoods(self, mt):
         return mt.annotate_cols(
             log_likelihoods=hl.struct(**{
-                pop: hl.agg.sum(self.log_likelihood(mt.GT, mt.freqs, pop)) + hl.log(self.proportions[pop])
+                pop: hl.agg.sum(log_likelihood(mt.GT, mt.freqs, pop)) + hl.log(self.proportions[pop])
                 for pop in self.proportions
             })
         )
@@ -84,21 +81,29 @@ class AncestryPredictor:
                 for pop in self.proportions
             })
         )
-    
-    def predict_ancestry(self, mt):
-        return mt.annotate_cols(predicted_ancestry=hl.bind(
-            lambda x: hl.sorted(x.items(), key=lambda item: item[1], reverse=True)[0][0],
-            mt.posteriors
-        ))
-    
-    def fit(self, snps=[]):
-        if len(snps) == 0:
-            mt_filtered = self.mt
-        else:
-            mt_filtered = self.mt.filter_rows(hl.literal(snps).contains(self.mt.rsid))
+        
+    def fit(self, mt, group_name, snps):
+        self.group_name = group_name
+        self.snps = snps
 
-        mt_annotated = self.annotate_with_freqs(mt_filtered, mt_filtered.pop)
-        mt_likelihood = self.log_likelihoods(mt_annotated)
+        self.total_subjects = mt.count_cols()
+        ethnicity_counts = mt.aggregate_cols(hl.agg.counter(mt.pop))
+        proportions = {k: v / self.total_subjects for k, v in ethnicity_counts.items()}
+        self.proportions = proportions
+
+        mt = mt.filter_rows(hl.literal(self.snps).contains(mt.rsid))
+        self.freqs_ht = self.freqs_estimates(mt)
+        self.is_fitted = True
+        return self
+    
+    def predict(self, mt):
+        if not self.is_fitted:
+            raise ValueError('Predictor is not fitted yet!')
+        
+        mt_likelihood = self.log_likelihoods(self.annotate_mt(mt))
         mt_probs = self.calculate_posteriors(mt_likelihood)
 
-        return mt_probs
+        return mt_probs.annotate_cols(predicted_ancestry=hl.bind(
+            lambda x: hl.sorted(x.items(), key=lambda item: item[1], reverse=True)[0][0],
+            mt_probs.posteriors
+        ))
